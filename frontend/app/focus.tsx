@@ -73,6 +73,11 @@ export default function FocusScreen() {
   const [isActive, setIsActive] = useState(true);
   const [outcome, setOutcome] = useState<Outcome>('none');
 
+  // TEMPORARY DIAGNOSTIC: pulse/glow disabled (static values below) to test
+  // whether an Animated.loop still running when this screen mounts on top
+  // of Today (whose own hero card has a similar looping animation) is the
+  // native crash trigger. shadowOpacity is also an iOS-only style property;
+  // animating it with an Animated.Value on Android may not be safe either.
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const glowAnim  = useRef(new Animated.Value(0.3)).current;
 
@@ -139,20 +144,7 @@ export default function FocusScreen() {
     })();
   }, [isActive, outcome, taskId, taskDate, patchTask]);
 
-  useEffect(() => {
-    if (!isActive) return;
-    const pulse = Animated.loop(Animated.sequence([
-      Animated.timing(pulseAnim, { toValue: 1.06, duration: 1800, useNativeDriver: true }),
-      Animated.timing(pulseAnim, { toValue: 1,    duration: 1800, useNativeDriver: true }),
-    ]));
-    const glow = Animated.loop(Animated.sequence([
-      Animated.timing(glowAnim, { toValue: 0.55, duration: 2200, useNativeDriver: false }),
-      Animated.timing(glowAnim, { toValue: 0.25, duration: 2200, useNativeDriver: false }),
-    ]));
-    pulse.start();
-    glow.start();
-    return () => { pulse.stop(); glow.stop(); };
-  }, [isActive]);
+  // Loop disabled for diagnostics — see note above pulseAnim/glowAnim.
 
   const { hours, minutes, seconds } = formatRemaining(timeRemaining);
   const totalDuration = parseTimeToDate(endTime).getTime() - parseTimeToDate(startTime).getTime();
@@ -193,18 +185,17 @@ export default function FocusScreen() {
       }]}>
 
         <View style={styles.iconSection}>
-          <Animated.View style={[styles.iconRing, {
-            transform: [{ scale: pulseAnim }],
+          <View style={[styles.iconRing, {
             shadowColor: colors.accent,
             shadowOffset: { width: 0, height: 0 },
-            shadowOpacity: glowAnim as any,
+            shadowOpacity: 0.4,
             shadowRadius: 28,
             elevation: 8,
           }]}>
             <View style={[styles.iconInner, { backgroundColor: `${colors.accent}22` }]}>
               <Ionicons name={getIcon(icon)} size={54} color={colors.accent} />
             </View>
-          </Animated.View>
+          </View>
         </View>
 
         <Text style={styles.taskLabel}>{label}</Text>

@@ -6,12 +6,9 @@ import {
   TouchableOpacity,
   StyleSheet,
   TextInput,
-  Alert,
   ActivityIndicator,
-  KeyboardAvoidingView,
   Platform,
-  Animated,
-  PanResponder,
+  Keyboard,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
@@ -19,9 +16,9 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useSimpleTheme, ThemeTokens } from "../../context/SimpleTheme";
 import ConfirmModal from "../../components/ConfirmModal";
+import { notify } from "../../utils/confirm";
 
 const BASE = process.env.EXPO_PUBLIC_BACKEND_URL || "";
-const SCROLL_ID = "routine-scroll";
 
 interface Slot {
   id: string;
@@ -139,61 +136,27 @@ function getMonthMatrixLocal(year: number, month: number): (number | null)[][] {
   return weeks;
 }
 
-/** Block-reflow, duration-conserving, day-set-aware reorder math.
- * `others` = full slot list minus the dragged slot, in committed time order.
- * `oldIndexInOthers` = dragged slot's original position relative to `others`.
- * `targetIndexInOthers` = desired insertion index within `others` (0..others.length).
- */
-function computeReflow(
-  others: Slot[],
-  dragged: Slot,
-  oldIndexInOthers: number,
-  targetIndexInOthers: number
-): Record<string, { start_time: string; end_time: string }> | null {
-  if (targetIndexInOthers === oldIndexInOthers) return null;
-  const dDur = diffMinutes(dragged.start_time, dragged.end_time);
+/** After a reorder, repacks the affected index range [lo, hi] (in `data`,
+ * the NEW order) with contiguous times based on each item's own duration —
+ * starting from whatever time the range's first slot (by OLD position)
+ * originally had, so the total time window the block occupies is
+ * preserved; only who sits in which part of it changes. */
+function resequenceRange(
+  data: Slot[],
+  lo: number,
+  hi: number,
+  anchorStart: string
+): Record<string, { start_time: string; end_time: string }> {
   const changes: Record<string, { start_time: string; end_time: string }> = {};
-
-  if (targetIndexInOthers > oldIndexInOthers) {
-    const blockAll = others.slice(oldIndexInOthers, targetIndexInOthers);
-    const block = blockAll.filter(s => s.days.some(d => dragged.days.includes(d)));
-    if (block.length === 0) return null;
-    let cursor = dragged.start_time;
-    for (const item of block) {
-      const dur = diffMinutes(item.start_time, item.end_time);
-      const newEnd = calcEndTime(cursor, dur);
-      changes[item.id] = { start_time: cursor, end_time: newEnd };
-      cursor = newEnd;
-    }
-    changes[dragged.id] = { start_time: cursor, end_time: calcEndTime(cursor, dDur) };
-  } else {
-    const blockAll = others.slice(targetIndexInOthers, oldIndexInOthers);
-    const block = blockAll.filter(s => s.days.some(d => dragged.days.includes(d)));
-    if (block.length === 0) return null;
-    const draggedNewStart = block[0].start_time;
-    changes[dragged.id] = { start_time: draggedNewStart, end_time: calcEndTime(draggedNewStart, dDur) };
-    let cursor = calcEndTime(draggedNewStart, dDur);
-    for (const item of block) {
-      const dur = diffMinutes(item.start_time, item.end_time);
-      const newEnd = calcEndTime(cursor, dur);
-      changes[item.id] = { start_time: cursor, end_time: newEnd };
-      cursor = newEnd;
-    }
+  let cursor = anchorStart;
+  for (let i = lo; i <= hi; i++) {
+    const item = data[i];
+    const dur = diffMinutes(item.start_time, item.end_time);
+    const newEnd = calcEndTime(cursor, dur);
+    changes[item.id] = { start_time: cursor, end_time: newEnd };
+    cursor = newEnd;
   }
   return changes;
-}
-
-function findInsertIndex(
-  others: Slot[],
-  layouts: Record<string, { y: number; height: number }>,
-  absCenterY: number
-): number {
-  for (let i = 0; i < others.length; i++) {
-    const l = layouts[others[i].id];
-    if (!l) continue;
-    if (absCenterY < l.y + l.height / 2) return i;
-  }
-  return others.length;
 }
 
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
@@ -345,6 +308,23 @@ function SlotModal({
   T: ThemeTokens;
 }) {
   const insets = useSafeAreaInsets();
+  const scrollRef = useRef<ScrollView>(null);
+  const [kbHeight, setKbHeight] = useState(0);
+
+  // KeyboardAvoidingView's built-in behaviors assume they're anchored near
+  // the actual screen root; this sheet lives inside a manually absolutely-
+  // positioned overlay, so its height heuristics miscalculate and the sheet
+  // stays put while the keyboard covers it. Tracking the real keyboard
+  // height and pushing the sheet up by exactly that amount is more direct
+  // and doesn't depend on those heuristics working out.
+  useEffect(() => {
+    const showEvt = Platform.OS === "android" ? "keyboardDidShow" : "keyboardWillShow";
+    const hideEvt = Platform.OS === "android" ? "keyboardDidHide" : "keyboardWillHide";
+    const showSub = Keyboard.addListener(showEvt, (e) => setKbHeight(e.endCoordinates?.height ?? 0));
+    const hideSub = Keyboard.addListener(hideEvt, () => setKbHeight(0));
+    return () => { showSub.remove(); hideSub.remove(); };
+  }, []);
+
   const isNew = !slot?.id;
   const [label, setLabel] = useState(slot?.label ?? "");
   const [time, setTime] = useState(slot?.start_time ?? "09:00");
@@ -369,11 +349,11 @@ function SlotModal({
 
   const handleSave = () => {
     if (!label.trim()) {
-      Alert.alert("Name required");
+      notify("Name required", "Please enter a name for this activity.");
       return;
     }
     if (!isOneOff && selectedDays.length === 0) {
-      Alert.alert("Select at least one day");
+      notify("Select at least one day", "Choose at least one day for this activity to repeat on.");
       return;
     }
 
@@ -414,11 +394,9 @@ function SlotModal({
   return (
     <View style={ms.overlay}>
       <TouchableOpacity style={ms.backdrop} activeOpacity={1} onPress={onClose} />
-      <KeyboardAvoidingView
-        style={ms.sheetWrap}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
+      <View style={[ms.sheetWrap, { marginBottom: kbHeight }]}>
         <ScrollView
+          ref={scrollRef}
           style={[ms.sheet, { backgroundColor: T.surface, borderColor: T.border }]}
           keyboardShouldPersistTaps="handled"
         >
@@ -533,6 +511,14 @@ function SlotModal({
             style={[ms.input, ms.notesInput, { backgroundColor: T.bg, borderColor: T.border, color: T.t1 }]}
             value={notes}
             onChangeText={setNotes}
+            // Android's ScrollView doesn't auto-scroll a focused input into
+            // view the way iOS does, so KeyboardAvoidingView's "height"
+            // behavior alone isn't enough here — the Notes field sits near
+            // the bottom, right where the keyboard covers it. Scrolling to
+            // the end on focus reliably brings it above the keyboard.
+            onFocus={() => {
+              setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+            }}
             placeholder="Add a note..."
             placeholderTextColor={T.t2}
             multiline
@@ -561,7 +547,7 @@ function SlotModal({
               bottom inset keeps them clear of it on every device. */}
           <View style={{ height: 12 + insets.bottom }} />
         </ScrollView>
-      </KeyboardAvoidingView>
+      </View>
 
       <ConfirmModal
         visible={confirmDelete}
@@ -576,6 +562,72 @@ function SlotModal({
   );
 }
 
+function RoutineRow({
+  slot,
+  canReorder,
+  isFirst,
+  isLast,
+  onMoveUp,
+  onMoveDown,
+  T,
+  onOpenEdit,
+}: {
+  slot: Slot;
+  canReorder: boolean;
+  isFirst: boolean;
+  isLast: boolean;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  T: ThemeTokens;
+  onOpenEdit: (slot: Slot) => void;
+}) {
+  const duration = diffMinutes(slot.start_time, slot.end_time);
+  const isOneOffSlot = !!slot.specific_date;
+
+  return (
+    <View style={[s.item, { backgroundColor: T.surface, borderColor: T.border }]}>
+      <TouchableOpacity style={s.itemBody} onPress={() => onOpenEdit(slot)} activeOpacity={0.7}>
+        <View style={s.itemInfo}>
+          <View style={s.itemNameRow}>
+            <Text style={[s.itemName, { color: T.t1 }]}>{slot.label}</Text>
+            {!!slot.notes && <View style={[s.noteDot, { backgroundColor: T.orange }]} />}
+          </View>
+          <Text style={[s.itemMeta, { color: T.t2 }]}>
+            {slot.start_time} · {formatDur(duration)}
+            {isOneOffSlot ? ` · ${formatSpecificDateShort(slot.specific_date!)}` : ""}
+          </Text>
+        </View>
+        <View style={[s.badge, { borderColor: isOneOffSlot ? T.orange : T.border }]}>
+          <Text style={[s.badgeText, { color: isOneOffSlot ? T.orange : T.t2 }]}>
+            {isOneOffSlot ? "One-off" : recurrenceLabel(slot.days)}
+          </Text>
+        </View>
+      </TouchableOpacity>
+
+      {canReorder && (
+        <View style={s.reorderCol}>
+          <TouchableOpacity
+            onPress={onMoveUp}
+            disabled={isFirst}
+            style={s.reorderBtn}
+            hitSlop={{ top: 6, bottom: 2, left: 8, right: 8 }}
+          >
+            <Ionicons name="chevron-up" size={16} color={isFirst ? T.border : T.t3} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={onMoveDown}
+            disabled={isLast}
+            style={s.reorderBtn}
+            hitSlop={{ top: 2, bottom: 6, left: 8, right: 8 }}
+          >
+            <Ionicons name="chevron-down" size={16} color={isLast ? T.border : T.t3} />
+          </TouchableOpacity>
+        </View>
+      )}
+    </View>
+  );
+}
+
 export default function RoutineScreen() {
   const { T } = useSimpleTheme();
   const params = useLocalSearchParams<{ editSlotId?: string }>();
@@ -586,35 +638,11 @@ export default function RoutineScreen() {
   const [editing, setEditing] = useState<Partial<Slot> | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [filter, setFilter] = useState("all");
-  const [scrollEnabled, setScrollEnabled] = useState(true);
-
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const dragY = useRef(new Animated.Value(0)).current;
-  const rowLayouts = useRef<Record<string, { y: number; height: number }>>({});
-  const dragCtx = useRef<{
-    othersSnapshot: Slot[];
-    oldIndexInOthers: number;
-    dragged: Slot;
-    layoutSnapshot: Record<string, { y: number; height: number }>;
-  } | null>(null);
-  const [previewChanges, setPreviewChanges] = useState<Record<string, { start_time: string; end_time: string }> | null>(null);
-  const [dropBeforeId, setDropBeforeId] = useState<string | "END" | null>(null);
   // A stack of reorder steps, most recent last. Undo always reverts the
   // last step and pops it, so repeated presses walk back through history.
   // Persists for as long as the user stays on this screen — cleared on
   // blur, not on a timer.
   const [undoStack, setUndoStack] = useState<{ id: string; start_time: string; end_time: string }[][]>([]);
-
-  useEffect(() => {
-    if (Platform.OS !== "web") return;
-    const style = document.createElement("style");
-    style.textContent = `
-      #${SCROLL_ID}::-webkit-scrollbar { display: none; }
-      #${SCROLL_ID} { scrollbar-width: none; -ms-overflow-style: none; }
-    `;
-    document.head.appendChild(style);
-    return () => { document.head.removeChild(style); };
-  }, []);
 
   const fetchSlots = useCallback(async () => {
     try {
@@ -641,10 +669,10 @@ export default function RoutineScreen() {
     setModalOpen(true);
   };
 
-  const openEdit = (slot: Slot) => {
+  const openEdit = useCallback((slot: Slot) => {
     setEditing(slot);
     setModalOpen(true);
-  };
+  }, []);
 
   const closeModal = () => {
     setModalOpen(false);
@@ -660,7 +688,7 @@ export default function RoutineScreen() {
       openEdit(slot);
       router.setParams({ editSlotId: undefined });
     }
-  }, [params.editSlotId, loading, slots]);
+  }, [params.editSlotId, loading, slots, openEdit]);
 
   const saveSlot = async (data: Partial<Slot>) => {
     try {
@@ -687,14 +715,14 @@ export default function RoutineScreen() {
 
       if (!res.ok) {
         const err = await res.json();
-        Alert.alert("Error", JSON.stringify(err));
+        notify("Error", JSON.stringify(err));
         return;
       }
 
       closeModal();
       fetchSlots();
     } catch (e) {
-      Alert.alert("Network error", String(e));
+      notify("Network error", String(e));
     }
   };
 
@@ -708,107 +736,47 @@ export default function RoutineScreen() {
     }
   };
 
-  const handleDragGrant = useCallback((slot: Slot) => {
+  // Applies a reorder of the affected range [lo, hi] (in `newData`, the new
+  // order) by repacking it with contiguous times anchored to whatever time
+  // the range's first slot (by OLD position) originally had.
+  const applyReorder = useCallback((newData: Slot[], lo: number, hi: number) => {
+    const anchorStart = slots[lo]?.start_time;
+    if (!anchorStart) return;
+
+    const changes = resequenceRange(newData, lo, hi, anchorStart);
+    if (Object.keys(changes).length === 0) return;
+
+    const snapshot = Object.keys(changes).map(id => {
+      const orig = slots.find(s => s.id === id);
+      return orig ? { id, start_time: orig.start_time, end_time: orig.end_time } : null;
+    }).filter((s): s is { id: string; start_time: string; end_time: string } => s !== null);
+    if (snapshot.length > 0) setUndoStack(prev => [...prev, snapshot]);
+
+    Promise.all(Object.entries(changes).map(([id, ch]) =>
+      fetch(`${BASE}/api/schedule-slots/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(ch),
+      })
+    )).catch(e => console.error(e));
+
     setSlots(prevSlots => {
-      const idx = prevSlots.findIndex(s => s.id === slot.id);
-      const others = prevSlots.filter(s => s.id !== slot.id);
-      dragCtx.current = {
-        othersSnapshot: others,
-        oldIndexInOthers: idx,
-        dragged: slot,
-        layoutSnapshot: { ...rowLayouts.current },
-      };
-      return prevSlots;
+      const next = prevSlots.map(s => changes[s.id] ? { ...s, ...changes[s.id] } : s);
+      return [...next].sort((a, b) => a.start_time.localeCompare(b.start_time));
     });
-    dragY.setValue(0);
-    setDraggingId(slot.id);
-    setScrollEnabled(false);
-    setDropBeforeId(null);
-  }, [dragY]);
+  }, [slots]);
 
-  const handleDragMove = useCallback((dy: number) => {
-    dragY.setValue(dy);
-    const ctx = dragCtx.current;
-    if (!ctx) return;
-    const layout = ctx.layoutSnapshot[ctx.dragged.id];
-    if (!layout) return;
-    const absCenter = layout.y + dy + layout.height / 2;
-    const targetIdx = findInsertIndex(ctx.othersSnapshot, ctx.layoutSnapshot, absCenter);
-    const changes = computeReflow(ctx.othersSnapshot, ctx.dragged, ctx.oldIndexInOthers, targetIdx);
-    setPreviewChanges(changes);
-    const dropSlot = ctx.othersSnapshot[targetIdx];
-    setDropBeforeId(dropSlot ? dropSlot.id : "END");
-  }, [dragY]);
-
-  const handleDragRelease = useCallback(() => {
-    setDraggingId(null);
-    setScrollEnabled(true);
-    setDropBeforeId(null);
-    dragY.setValue(0);
-    const ctx = dragCtx.current;
-    dragCtx.current = null;
-
-    setPreviewChanges(currentChanges => {
-      if (!ctx || !currentChanges || Object.keys(currentChanges).length === 0) {
-        return null;
-      }
-
-      setSlots(prevSlots => {
-        const snapshot = Object.keys(currentChanges).map(id => {
-          const orig = prevSlots.find(s => s.id === id)!;
-          return { id, start_time: orig.start_time, end_time: orig.end_time };
-        });
-
-        setUndoStack(prev => [...prev, snapshot]);
-
-        Promise.all(Object.entries(currentChanges).map(([id, ch]) =>
-          fetch(`${BASE}/api/schedule-slots/${id}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(ch),
-          })
-        )).catch(e => console.error(e));
-
-        const next = prevSlots.map(s => currentChanges[s.id] ? { ...s, ...currentChanges[s.id] } : s);
-        return [...next].sort((a, b) => a.start_time.localeCompare(b.start_time));
-      });
-
-      return null;
-    });
-  }, [dragY]);
-
-  // PanResponder never reliably engages on the web build here — the browser's
-  // own touch/mouse handling wins before the RN responder system gets a
-  // look-in, which is why dragging did nothing at all. On web we bypass
-  // PanResponder entirely and drive the same handleDragGrant/Move/Release
-  // logic from raw mouse/touch listeners attached directly to the window,
-  // which is the reliable way to track a drag once it leaves the grip icon.
-  const startWebDrag = useCallback((slot: Slot, clientY: number) => {
-    if (Platform.OS !== "web") return;
-    handleDragGrant(slot);
-    const startY = clientY;
-
-    const onMove = (e: any) => {
-      const y = e.touches && e.touches[0] ? e.touches[0].clientY : e.clientY;
-      if (typeof y !== "number") return;
-      if (e.cancelable) e.preventDefault();
-      handleDragMove(y - startY);
-    };
-    const onUp = () => {
-      handleDragRelease();
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("touchmove", onMove);
-      window.removeEventListener("touchend", onUp);
-      window.removeEventListener("touchcancel", onUp);
-    };
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    window.addEventListener("touchmove", onMove, { passive: false });
-    window.addEventListener("touchend", onUp);
-    window.addEventListener("touchcancel", onUp);
-  }, [handleDragGrant, handleDragMove, handleDragRelease]);
+  // Swaps the slot at `index` with its immediate neighbor in the given
+  // direction and repacks the two affected times. Only enabled while
+  // filter === "all", so `index` here always lines up with `slots`' own
+  // order (visibleSlots === slots in that case).
+  const moveSlot = useCallback((index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= slots.length) return;
+    const newData = [...slots];
+    [newData[index], newData[target]] = [newData[target], newData[index]];
+    applyReorder(newData, Math.min(index, target), Math.max(index, target));
+  }, [slots, applyReorder]);
 
   const handleUndo = useCallback(() => {
     setUndoStack(prevStack => {
@@ -835,6 +803,12 @@ export default function RoutineScreen() {
     });
   }, []);
 
+  const visibleSlots = filter === "all"
+    ? slots
+    : slots.filter(slot => daysToRecurrenceKey(slot.days) === filter);
+
+  const canReorder = filter === "all";
+
   if (loading) {
     return (
       <View style={[s.centered, { backgroundColor: T.bg }]}>
@@ -843,29 +817,12 @@ export default function RoutineScreen() {
     );
   }
 
-  const visibleSlots = filter === "all"
-    ? slots
-    : slots.filter(slot => daysToRecurrenceKey(slot.days) === filter);
-
-  const canDrag = filter === "all";
-
-  const displayList = (() => {
-    if (!previewChanges) return visibleSlots;
-    const map = { ...previewChanges };
-    if (draggingId) delete map[draggingId];
-    const next = slots.map(s => map[s.id] ? { ...s, ...map[s.id] } : s);
-    const sorted = [...next].sort((a, b) => a.start_time.localeCompare(b.start_time));
-    return filter === "all" ? sorted : sorted.filter(sl => daysToRecurrenceKey(sl.days) === filter);
-  })();
-
   return (
     <View style={[s.screen, { backgroundColor: T.bg }]}>
       <ScrollView
-        nativeID={SCROLL_ID}
         style={s.scroll}
         contentContainerStyle={s.scrollContent}
         showsVerticalScrollIndicator={false}
-        scrollEnabled={scrollEnabled}
       >
         <View style={s.header}>
           <Text style={[s.eyebrow, { color: T.orange }]}>Daily template</Text>
@@ -911,93 +868,19 @@ export default function RoutineScreen() {
           </View>
         )}
 
-        {displayList.map((slot) => {
-          const duration = diffMinutes(slot.start_time, slot.end_time);
-          const isOneOffSlot = !!slot.specific_date;
-          const isDraggingThis = draggingId === slot.id;
-
-          // PanResponder is only used on native (iOS/Android), where it
-          // works reliably. On web, startWebDrag drives the same drag
-          // logic from raw mouse/touch listeners instead — see its comment
-          // for why.
-          const panResponder = canDrag && Platform.OS !== "web" ? PanResponder.create({
-            onStartShouldSetPanResponder: () => true,
-            onStartShouldSetPanResponderCapture: () => true,
-            onMoveShouldSetPanResponder: () => true,
-            onMoveShouldSetPanResponderCapture: () => true,
-            onPanResponderTerminationRequest: () => false,
-            onPanResponderGrant: () => handleDragGrant(slot),
-            onPanResponderMove: (_e, gesture) => handleDragMove(gesture.dy),
-            onPanResponderRelease: () => handleDragRelease(),
-            onPanResponderTerminate: () => handleDragRelease(),
-          }) : null;
-
-          const webDragHandlers: any = canDrag && Platform.OS === "web" ? {
-            onMouseDown: (e: any) => { e.preventDefault?.(); startWebDrag(slot, e.clientY); },
-            onTouchStart: (e: any) => {
-              const t = e.touches && e.touches[0];
-              if (t) startWebDrag(slot, t.clientY);
-            },
-          } : {};
-
-          const showLineBefore = draggingId !== null && dropBeforeId === slot.id;
-
-          return (
-            <React.Fragment key={slot.id}>
-              {showLineBefore && <View style={[s.dropLine, { backgroundColor: T.orange }]} />}
-              <View
-                onLayout={(e) => {
-                  rowLayouts.current[slot.id] = { y: e.nativeEvent.layout.y, height: e.nativeEvent.layout.height };
-                }}
-                style={[
-                  s.item,
-                  { backgroundColor: T.surface, borderColor: T.border },
-                  isDraggingThis && {
-                    transform: [{ translateY: dragY }],
-                    zIndex: 999,
-                    elevation: 12,
-                    shadowColor: "#000",
-                    shadowOpacity: 0.25,
-                    shadowRadius: 10,
-                    shadowOffset: { width: 0, height: 4 },
-                  },
-                ] as any}
-              >
-                <TouchableOpacity style={s.itemBody} onPress={() => openEdit(slot)} activeOpacity={0.7}>
-                  <View style={s.itemInfo}>
-                    <View style={s.itemNameRow}>
-                      <Text style={[s.itemName, { color: T.t1 }]}>{slot.label}</Text>
-                      {!!slot.notes && <View style={[s.noteDot, { backgroundColor: T.orange }]} />}
-                    </View>
-                    <Text style={[s.itemMeta, { color: T.t2 }]}>
-                      {slot.start_time} · {formatDur(duration)}
-                      {isOneOffSlot ? ` · ${formatSpecificDateShort(slot.specific_date!)}` : ""}
-                    </Text>
-                  </View>
-                  <View style={[s.badge, { borderColor: isOneOffSlot ? T.orange : T.border }]}>
-                    <Text style={[s.badgeText, { color: isOneOffSlot ? T.orange : T.t2 }]}>
-                      {isOneOffSlot ? "One-off" : recurrenceLabel(slot.days)}
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-
-                {canDrag && (
-                  <View
-                    {...(panResponder ? panResponder.panHandlers : webDragHandlers)}
-                    style={s.gripHandle}
-                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  >
-                    <Ionicons name="reorder-three-outline" size={20} color={T.t3} />
-                  </View>
-                )}
-              </View>
-            </React.Fragment>
-          );
-        })}
-
-        {draggingId !== null && dropBeforeId === "END" && (
-          <View style={[s.dropLine, { backgroundColor: T.orange }]} />
-        )}
+        {visibleSlots.map((slot, i) => (
+          <RoutineRow
+            key={slot.id}
+            slot={slot}
+            canReorder={canReorder}
+            isFirst={i === 0}
+            isLast={i === visibleSlots.length - 1}
+            onMoveUp={() => moveSlot(i, -1)}
+            onMoveDown={() => moveSlot(i, 1)}
+            T={T}
+            onOpenEdit={openEdit}
+          />
+        ))}
 
         <View style={{ height: 72 }} />
       </ScrollView>
@@ -1063,8 +946,6 @@ const s = StyleSheet.create({
   emptyDesc: { fontFamily: "Montserrat_500Medium", fontSize: 13, textAlign: "center", lineHeight: 20 },
   item: { flexDirection: "row", alignItems: "center", borderWidth: 1, borderRadius: 14, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 6 },
   itemBody: { flex: 1, flexDirection: "row", alignItems: "center", gap: 12 },
-  gripHandle: { paddingLeft: 10, paddingVertical: 4 },
-  dropLine: { height: 3, borderRadius: 2, marginVertical: 5 },
   itemInfo: { flex: 1 },
   itemNameRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   itemName: { fontFamily: "Montserrat_600SemiBold", fontSize: 13 },
@@ -1073,6 +954,9 @@ const s = StyleSheet.create({
   badge: { borderWidth: 1, borderRadius: 99, paddingVertical: 4, paddingHorizontal: 10 },
   badgeText: { fontFamily: "Montserrat_600SemiBold", fontSize: 10 },
   fade: { position: "absolute", bottom: 0, left: 0, right: 0, height: 56 } as any,
+
+  reorderCol: { paddingLeft: 10, alignItems: "center", justifyContent: "center" },
+  reorderBtn: { paddingVertical: 3, paddingHorizontal: 4 },
 
   fab: {
     position: "absolute",

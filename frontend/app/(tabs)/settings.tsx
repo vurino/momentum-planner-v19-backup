@@ -5,7 +5,10 @@ import {
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import * as FileSystem from "expo-file-system";
+// SDK 54 replaced expo-file-system's API with File/Directory classes and
+// moved the classic documentDirectory/EncodingType/writeAsStringAsync/
+// readAsStringAsync surface (still used below) to this legacy subpath.
+import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
 import Toggle from "../../components/Toggle";
@@ -19,7 +22,7 @@ import {
 import { notify } from "../../utils/confirm";
 import ConfirmModal from "../../components/ConfirmModal";
 
-const BASE = "";
+const BASE = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 
 const APPEARANCE_OPTIONS: { key: ThemeMode; label: string }[] = [
   { key: "light",  label: "Light" },
@@ -28,14 +31,27 @@ const APPEARANCE_OPTIONS: { key: ThemeMode; label: string }[] = [
 ];
 
 interface Prefs {
-  taskReminders:    boolean;
-  dailySummary:     boolean;
+  taskReminders:        boolean;
+  dailySummary:         boolean;
+  reminderLeadMinutes:  number;
+  dailySummaryHour:     number;
 }
 
 const DEFAULTS: Prefs = {
-  taskReminders:    true,
-  dailySummary:     false,
+  taskReminders:        true,
+  dailySummary:         false,
+  reminderLeadMinutes:  5,
+  dailySummaryHour:     21,
 };
+
+const LEAD_OPTIONS = [5, 10, 15, 30];
+const SUMMARY_HOUR_OPTIONS = [18, 19, 20, 21, 22, 23];
+
+function formatHour12(hour: number): string {
+  const h = hour % 12 === 0 ? 12 : hour % 12;
+  const period = hour < 12 ? "AM" : "PM";
+  return `${h} ${period}`;
+}
 
 function todayStr() {
   return new Date().toISOString().split("T")[0];
@@ -71,7 +87,7 @@ export default function SettingsScreen() {
   useEffect(() => {
     (async () => {
       try {
-        const keys = ["taskReminders", "dailySummary"];
+        const keys = ["taskReminders", "dailySummary", "reminderLeadMinutes", "dailySummaryHour"];
         const stored = await AsyncStorage.multiGet(keys);
         const parsed: Partial<Prefs> = {};
         stored.forEach(([key, val]) => {
@@ -81,7 +97,7 @@ export default function SettingsScreen() {
         setPrefs(merged);
         if (merged.dailySummary) {
           const granted = await requestNotificationPermissions();
-          if (granted) scheduleDailySummary();
+          if (granted) scheduleDailySummary(merged.dailySummaryHour);
         }
       } catch (e) {
         console.error(e);
@@ -122,6 +138,24 @@ export default function SettingsScreen() {
     if (key === "taskReminders" && !val) {
       await cancelTaskReminders();
     }
+  };
+
+  const setReminderLead = async (minutes: number) => {
+    setPrefs(p => ({ ...p, reminderLeadMinutes: minutes }));
+    try {
+      await AsyncStorage.setItem("reminderLeadMinutes", JSON.stringify(minutes));
+    } catch (e) { console.error(e); }
+    // Today re-reads this pref and reschedules the next time it fetches
+    // (on focus), same as how turning taskReminders on isn't scheduled
+    // from here either — there's no task list available on this screen.
+  };
+
+  const setDailySummaryHour = async (hour: number) => {
+    setPrefs(p => ({ ...p, dailySummaryHour: hour }));
+    try {
+      await AsyncStorage.setItem("dailySummaryHour", JSON.stringify(hour));
+    } catch (e) { console.error(e); }
+    if (prefs.dailySummary) await scheduleDailySummary(hour);
   };
 
   const handleReset = () => {
@@ -195,18 +229,49 @@ export default function SettingsScreen() {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+      } else if (Platform.OS === "android" && FileSystem.StorageAccessFramework) {
+        // The share sheet (below, used as a fallback) only lists apps that
+        // can *receive* a shared file — Drive, Mail, etc. — never a plain
+        // "save to this folder on my phone" option. The Storage Access
+        // Framework is Android's actual mechanism for that: it opens a
+        // native folder picker and lets the file be written directly
+        // wherever the user points it (Downloads included).
+        try {
+          const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+          if (!perm.granted) {
+            setExporting(false);
+            return;
+          }
+          const destUri = await FileSystem.StorageAccessFramework.createFileAsync(
+            perm.directoryUri, fileName, "application/json"
+          );
+          await FileSystem.writeAsStringAsync(destUri, json, { encoding: FileSystem.EncodingType.UTF8 });
+          notify("Saved", `Backup saved as ${fileName} in the folder you chose.`);
+        } catch (safErr) {
+          console.error("SAF export failed, falling back to share sheet:", safErr);
+          const fileUri = FileSystem.documentDirectory + fileName;
+          await FileSystem.writeAsStringAsync(fileUri, json, { encoding: FileSystem.EncodingType.UTF8 });
+          const canShare = await Sharing.isAvailableAsync();
+          if (canShare) {
+            await Sharing.shareAsync(fileUri, {
+              mimeType: "application/json",
+              dialogTitle: "Save your Momentum Rise backup",
+            });
+          } else {
+            notify("Saved", `Backup saved as ${fileName}, but sharing isn't available on this device to move it elsewhere.`);
+          }
+        }
       } else {
-        // Native has no "Downloads folder" the app can just drop a file
-        // into — write it to the app's own sandboxed storage, then hand it
-        // to the OS share sheet so the user can save it wherever they like
-        // (Drive, Files, email, etc.).
+        // iOS has no Storage Access Framework equivalent — the share sheet
+        // (which does include a "Save to Files" option on iOS) is the
+        // normal way to get a file onto the device there.
         const fileUri = FileSystem.documentDirectory + fileName;
         await FileSystem.writeAsStringAsync(fileUri, json, { encoding: FileSystem.EncodingType.UTF8 });
         const canShare = await Sharing.isAvailableAsync();
         if (canShare) {
           await Sharing.shareAsync(fileUri, {
             mimeType: "application/json",
-            dialogTitle: "Save your Momentum Planner backup",
+            dialogTitle: "Save your Momentum Rise backup",
           });
         } else {
           notify("Saved", `Backup saved as ${fileName}, but sharing isn't available on this device to move it elsewhere.`);
@@ -235,7 +300,7 @@ export default function SettingsScreen() {
       const preview = cleaned.slice(0, 80).replace(/\s+/g, " ");
       notify(
         "Invalid file",
-        `That doesn't look like a Momentum Planner backup file.\n\n${err?.message || "Parse error"}\nFile starts with: ${preview || "(empty)"}`
+        `That doesn't look like a Momentum Rise backup file.\n\n${err?.message || "Parse error"}\nFile starts with: ${preview || "(empty)"}`
       );
     }
   };
@@ -265,8 +330,8 @@ export default function SettingsScreen() {
       const asset = result.assets[0];
       const content = await FileSystem.readAsStringAsync(asset.uri);
       parseBackupJson(content, asset.name || "backup.json");
-    } catch (e) {
-      notify("Invalid file", "That doesn't look like a Momentum Planner backup file.");
+    } catch (e: any) {
+      notify("Import failed", e?.message || "Could not read that file. Please try again.");
     }
   };
 
@@ -281,10 +346,11 @@ export default function SettingsScreen() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ schedule_slots: slots, daily_tasks: tasks }),
       });
-      if (!res.ok) throw new Error("import failed");
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.detail || `Server returned ${res.status}`);
       notify("Done", "Your backup has been restored. Reopen Today, Routine, and History to see it.");
-    } catch (e) {
-      notify("Import failed", "Could not import your data. Make sure the file is a Momentum Planner export.");
+    } catch (e: any) {
+      notify("Import failed", e?.message || "Could not import your data. Check your connection.");
     } finally {
       setImporting(false);
     }
@@ -341,25 +407,69 @@ export default function SettingsScreen() {
 
         {/* Notifications */}
         <Text style={[s.sectionLabel, { color: T.t2, marginTop: 24 }]}>Notifications</Text>
-        <View style={[s.row, { backgroundColor: T.surface, borderColor: T.border }]}>
-          <View style={s.rowInfo}>
-            <Text style={[s.rowLabel, { color: T.t1 }]}>Task reminders</Text>
-            <Text style={[s.rowSub, { color: T.t2 }]}>5 min before each task</Text>
+        <View style={[s.row, s.rowColumn, { backgroundColor: T.surface, borderColor: T.border }]}>
+          <View style={s.rowTop}>
+            <View style={s.rowInfo}>
+              <Text style={[s.rowLabel, { color: T.t1 }]}>Task reminders</Text>
+              <Text style={[s.rowSub, { color: T.t2 }]}>{prefs.reminderLeadMinutes} min before each task</Text>
+            </View>
+            <Toggle
+              value={prefs.taskReminders}
+              onValueChange={v => setPref("taskReminders", v)}
+            />
           </View>
-          <Toggle
-            value={prefs.taskReminders}
-            onValueChange={v => setPref("taskReminders", v)}
-          />
+          {prefs.taskReminders && (
+            <View style={s.chipRow}>
+              {LEAD_OPTIONS.map(min => {
+                const active = prefs.reminderLeadMinutes === min;
+                return (
+                  <TouchableOpacity
+                    key={min}
+                    style={[
+                      s.chip,
+                      { borderColor: T.border },
+                      active && { backgroundColor: T.orange, borderColor: T.orange },
+                    ]}
+                    onPress={() => setReminderLead(min)}
+                  >
+                    <Text style={[s.chipText, { color: active ? "#fff" : T.t2 }]}>{min} min</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
         </View>
-        <View style={[s.row, { backgroundColor: T.surface, borderColor: T.border }]}>
-          <View style={s.rowInfo}>
-            <Text style={[s.rowLabel, { color: T.t1 }]}>Daily summary</Text>
-            <Text style={[s.rowSub, { color: T.t2 }]}>Evening recap at 9 pm</Text>
+        <View style={[s.row, s.rowColumn, { backgroundColor: T.surface, borderColor: T.border }]}>
+          <View style={s.rowTop}>
+            <View style={s.rowInfo}>
+              <Text style={[s.rowLabel, { color: T.t1 }]}>Daily summary</Text>
+              <Text style={[s.rowSub, { color: T.t2 }]}>Evening recap at {formatHour12(prefs.dailySummaryHour)}</Text>
+            </View>
+            <Toggle
+              value={prefs.dailySummary}
+              onValueChange={v => setPref("dailySummary", v)}
+            />
           </View>
-          <Toggle
-            value={prefs.dailySummary}
-            onValueChange={v => setPref("dailySummary", v)}
-          />
+          {prefs.dailySummary && (
+            <View style={s.chipRow}>
+              {SUMMARY_HOUR_OPTIONS.map(hour => {
+                const active = prefs.dailySummaryHour === hour;
+                return (
+                  <TouchableOpacity
+                    key={hour}
+                    style={[
+                      s.chip,
+                      { borderColor: T.border },
+                      active && { backgroundColor: T.orange, borderColor: T.orange },
+                    ]}
+                    onPress={() => setDailySummaryHour(hour)}
+                  >
+                    <Text style={[s.chipText, { color: active ? "#fff" : T.t2 }]}>{formatHour12(hour)}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
         </View>
 
         {/* Data */}
@@ -400,7 +510,7 @@ export default function SettingsScreen() {
         <View style={[s.row, s.dangerRow, { backgroundColor: T.surface }]}>
           <View style={s.rowInfo}>
             <Text style={[s.rowLabel, { color: T.danger }]}>Clear today's tasks</Text>
-            <Text style={[s.rowSub, { color: T.t2 }]}>Wipe current/upcoming tasks only — history stays</Text>
+            <Text style={[s.rowSub, { color: T.t2 }]}>Wipe current/upcoming tasks only</Text>
           </View>
           <TouchableOpacity
             style={s.resetBtn}
@@ -416,7 +526,7 @@ export default function SettingsScreen() {
         <View style={[s.row, s.dangerRow, { backgroundColor: T.surface }]}>
           <View style={s.rowInfo}>
             <Text style={[s.rowLabel, { color: T.danger }]}>Clear Routine</Text>
-            <Text style={[s.rowSub, { color: T.t2 }]}>Wipe the activity template only — history stays</Text>
+            <Text style={[s.rowSub, { color: T.t2 }]}>Wipe the activity template only</Text>
           </View>
           <TouchableOpacity
             style={s.resetBtn}
@@ -446,7 +556,7 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </View>
 
-        <Text style={[s.version, { color: T.t3 }]}>Momentum Planner</Text>
+        <Text style={[s.version, { color: T.t3 }]}>Momentum Rise</Text>
         <View style={{ height: 24 }} />
       </ScrollView>
 
@@ -514,10 +624,16 @@ const s = StyleSheet.create({
   sectionLabel:  { fontFamily: "Montserrat_700Bold", fontSize: 10, letterSpacing: 3, textTransform: "uppercase", marginBottom: 10, paddingLeft: 2 },
 
   row:           { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, borderWidth: 1, borderRadius: 14, padding: 16, marginBottom: 8 },
+  rowColumn:     { flexDirection: "column", alignItems: "stretch" },
+  rowTop:        { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
   dangerRow:     { borderWidth: 1, borderColor: "rgba(192,64,64,0.25)" },
   rowInfo:       { flex: 1 },
   rowLabel:      { fontFamily: "Montserrat_600SemiBold", fontSize: 14 },
   rowSub:        { fontFamily: "Montserrat_500Medium", fontSize: 11, marginTop: 3 },
+
+  chipRow:       { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 14 },
+  chip:          { borderWidth: 1, borderRadius: 99, paddingVertical: 7, paddingHorizontal: 14 },
+  chipText:      { fontFamily: "Montserrat_600SemiBold", fontSize: 11 },
 
   appearanceCard:   { borderWidth: 1, borderRadius: 14, padding: 16, marginBottom: 8 },
   appearanceRow:    { flexDirection: "row", gap: 8 },

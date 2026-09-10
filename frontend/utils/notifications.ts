@@ -50,7 +50,7 @@ export async function cancelTaskReminders() {
   }
 }
 
-export async function scheduleTaskReminders(tasks: TaskForReminder[]) {
+export async function scheduleTaskReminders(tasks: TaskForReminder[], leadMinutes: number = REMINDER_LEAD_MINUTES) {
   try {
     await cancelTaskReminders();
     const now = new Date();
@@ -58,16 +58,19 @@ export async function scheduleTaskReminders(tasks: TaskForReminder[]) {
     for (const task of tasks) {
       if (task.done || !task.start_time) continue;
       const startDate = parseTimeToday(task.start_time);
-      const reminderDate = new Date(startDate.getTime() - REMINDER_LEAD_MINUTES * 60 * 1000);
+      const reminderDate = new Date(startDate.getTime() - leadMinutes * 60 * 1000);
       if (reminderDate <= now) continue;
 
       await Notifications.scheduleNotificationAsync({
         identifier: `${TASK_REMINDER_PREFIX}${task.id}`,
         content: {
           title: "Coming up",
-          body: `${task.name} starts in ${REMINDER_LEAD_MINUTES} minutes`,
+          body: `${task.name} starts in ${leadMinutes} minutes`,
         },
-        trigger: reminderDate,
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DATE,
+          date: reminderDate,
+        },
       });
     }
   } catch (e) {
@@ -75,7 +78,7 @@ export async function scheduleTaskReminders(tasks: TaskForReminder[]) {
   }
 }
 
-export async function scheduleDailySummary() {
+export async function scheduleDailySummary(hour: number = 21) {
   try {
     await Notifications.cancelScheduledNotificationAsync(DAILY_SUMMARY_ID).catch(() => {});
     await Notifications.scheduleNotificationAsync({
@@ -84,7 +87,12 @@ export async function scheduleDailySummary() {
         title: "Daily summary",
         body: "See how your day went in Momentum.",
       },
-      trigger: { hour: 21, minute: 0, repeats: true },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DAILY,
+        hour,
+        minute: 0,
+        repeats: true,
+      },
     });
   } catch (e) {
     console.error("Failed to schedule daily summary:", e);

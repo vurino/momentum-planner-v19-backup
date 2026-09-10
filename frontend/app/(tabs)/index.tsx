@@ -10,6 +10,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useSimpleTheme, ThemeTokens } from "../../context/SimpleTheme";
 import { scheduleTaskReminders } from "../../utils/notifications";
 import ConfirmModal from "../../components/ConfirmModal";
+import { notify } from "../../utils/confirm";
 
 const BASE = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 const LIST_OPEN_KEY = "todayListOpen";
@@ -99,17 +100,14 @@ function isUnresolved(t: Task) {
   return !t.done && !t.skipped && !t.stopped;
 }
 
+// TEMPORARY DIAGNOSTIC: the looping pulse animation is disabled (static dot
+// instead) to test whether an active Animated.loop being unmounted/swapped
+// out mid-loop — which is exactly what happens when Stop or Start-early
+// changes which task is "active" and the hero card's layout structurally
+// changes — is the native crash trigger reported on Stop/Open-focus-timer.
+// If the crash stops happening with this change, we've found it.
 function PulsingDot({ color }: { color: string }) {
-  const anim = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(anim, { toValue: 0.2, duration: 1000, useNativeDriver: true }),
-        Animated.timing(anim, { toValue: 1,   duration: 1000, useNativeDriver: true }),
-      ])
-    ).start();
-  }, []);
-  return <Animated.View style={[styles.dot, { backgroundColor: color, opacity: anim }]} />;
+  return <View style={[styles.dot, { backgroundColor: color }]} />;
 }
 
 // Staggered fade: rows appear top-to-bottom on expand and disappear
@@ -212,8 +210,13 @@ function HeroCard({
           <Text style={[styles.heroLabelText, { color: accent }]}>{statusLabel}</Text>
         </View>
         <View style={styles.heroLinks}>
-          <TouchableOpacity onPress={() => setNoteOpen(o => !o)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-            <Text style={[styles.heroLinkText, { color: T.t2 }]}>{task.notes ? "Note •" : "Note"}</Text>
+          <TouchableOpacity
+            onPress={() => setNoteOpen(o => !o)}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            style={styles.noteLinkBtn}
+          >
+            <Text style={[styles.heroLinkText, { color: T.t2 }]}>Note</Text>
+            {!!task.notes && <View style={[styles.noteIndicatorDot, { backgroundColor: T.orange }]} />}
           </TouchableOpacity>
           {!started && (
             <TouchableOpacity onPress={() => onSkip(task.id, task.name || "This task")} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
@@ -311,8 +314,13 @@ function TaskRow({
             {timeStr} · {formatDur(duration)}
           </Text>
         </View>
-        <TouchableOpacity onPress={() => setNoteOpen(o => !o)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-          <Text style={[styles.taskLinkText, { color: T.t3 }]}>{task.notes ? "•" : "note"}</Text>
+        <TouchableOpacity
+          onPress={() => setNoteOpen(o => !o)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          style={styles.noteLinkBtn}
+        >
+          <Text style={[styles.taskLinkText, { color: T.t3 }]}>note</Text>
+          {!!task.notes && <View style={[styles.noteIndicatorDot, { backgroundColor: T.orange }]} />}
         </TouchableOpacity>
       </View>
       {noteOpen && (
@@ -410,7 +418,9 @@ export default function TodayScreen() {
       const remindersPref = await AsyncStorage.getItem("taskReminders");
       const remindersOn = remindersPref !== null ? JSON.parse(remindersPref) : true;
       if (remindersOn) {
-        scheduleTaskReminders(mapped.filter((t: Task) => isUnresolved(t))).catch(err => console.error(err));
+        const leadPref = await AsyncStorage.getItem("reminderLeadMinutes");
+        const leadMinutes = leadPref !== null ? JSON.parse(leadPref) : 5;
+        scheduleTaskReminders(mapped.filter((t: Task) => isUnresolved(t)), leadMinutes).catch(err => console.error(err));
       }
     } catch (e) {
       console.error("Fetch error:", e);
@@ -439,33 +449,52 @@ export default function TodayScreen() {
     setConfirmSkip({ id, name });
   };
 
+  // TEMPORARY DIAGNOSTIC: every one of these is being reported as crashing
+  // the whole app, while Note (which never touches this screen's state)
+  // isn't. Wrapping each body in try/catch means a catchable JS error will
+  // now surface as a themed dialog with the real message instead of taking
+  // the app down silently — and if it crashes even with this wrapper in
+  // place, that tells us it's a native-level crash, not a JS exception, and
+  // we'll know a device crash log is the only way to pin it down further.
   const confirmSkipNow = async () => {
-    if (!confirmSkip) return;
-    const { id } = confirmSkip;
-    setConfirmSkip(null);
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, skipped: true, auto_skipped: false } : t));
-    await patchTask(id, { skipped: true, auto_skipped: false });
+    try {
+      if (!confirmSkip) return;
+      const { id } = confirmSkip;
+      setConfirmSkip(null);
+      setTasks(prev => prev.map(t => t.id === id ? { ...t, skipped: true, auto_skipped: false } : t));
+      await patchTask(id, { skipped: true, auto_skipped: false });
+    } catch (e: any) {
+      notify("Debug: skip failed", e?.message || String(e));
+    }
   };
 
   const startTask = async (task: Task) => {
-    const startedAt = nowISO();
-    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, started_at: startedAt } : t));
-    await patchTask(task.id, { started_at: startedAt });
-    router.push({
-      pathname: "/focus",
-      params: {
-        id: task.id,
-        date: todayStr(),
-        label: task.name,
-        start_time: task.start_time ?? "",
-        end_time: task.end_time ?? "",
-      },
-    });
+    try {
+      const startedAt = nowISO();
+      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, started_at: startedAt } : t));
+      await patchTask(task.id, { started_at: startedAt });
+      router.push({
+        pathname: "/focus",
+        params: {
+          id: task.id,
+          date: todayStr(),
+          label: task.name,
+          start_time: task.start_time ?? "",
+          end_time: task.end_time ?? "",
+        },
+      });
+    } catch (e: any) {
+      notify("Debug: start failed", e?.message || String(e));
+    }
   };
 
   const completeTask = async (task: Task) => {
-    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, done: true, completed: true } : t));
-    await patchTask(task.id, { completed: true, completed_at: nowISO(), skipped: false, stopped: false, auto_skipped: false });
+    try {
+      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, done: true, completed: true } : t));
+      await patchTask(task.id, { completed: true, completed_at: nowISO(), skipped: false, stopped: false, auto_skipped: false });
+    } catch (e: any) {
+      notify("Debug: complete failed", e?.message || String(e));
+    }
   };
 
   const stopRequest = (task: Task) => {
@@ -473,12 +502,16 @@ export default function TodayScreen() {
   };
 
   const confirmStopNow = async () => {
-    if (!confirmStop) return;
-    const { id } = confirmStop;
-    setConfirmStop(null);
-    const stoppedAt = nowISO();
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, stopped: true, stopped_at: stoppedAt } : t));
-    await patchTask(id, { stopped: true, stopped_at: stoppedAt });
+    try {
+      if (!confirmStop) return;
+      const { id } = confirmStop;
+      setConfirmStop(null);
+      const stoppedAt = nowISO();
+      setTasks(prev => prev.map(t => t.id === id ? { ...t, stopped: true, stopped_at: stoppedAt } : t));
+      await patchTask(id, { stopped: true, stopped_at: stoppedAt });
+    } catch (e: any) {
+      notify("Debug: stop failed", e?.message || String(e));
+    }
   };
 
   const saveNote = async (id: string, notes: string) => {
@@ -704,6 +737,9 @@ const styles = StyleSheet.create({
   taskName:      { fontFamily: "Montserrat_600SemiBold", fontSize: 13 },
   taskMeta:      { fontFamily: "Montserrat_500Medium", fontSize: 10, marginTop: 2 },
   taskLinkText:  { fontFamily: "Montserrat_600SemiBold", fontSize: 10, textTransform: "uppercase" },
+
+  noteLinkBtn:      { flexDirection: "row", alignItems: "center", gap: 5 },
+  noteIndicatorDot: { width: 6, height: 6, borderRadius: 99 },
 
   noteEditor:    { marginTop: 4, marginBottom: 4, gap: 8 },
   noteInput:     { borderWidth: 1, borderRadius: 10, padding: 10, fontFamily: "Montserrat_500Medium", fontSize: 12, minHeight: 44, textAlignVertical: "top" },

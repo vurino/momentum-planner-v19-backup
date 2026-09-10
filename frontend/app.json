@@ -41,13 +41,19 @@
       [
         "expo-notifications",
         {
-          "icon": "./assets/images/icon.png",
-          "color": "#ffffff"
+          "icon": "./assets/images/Momentum_Rise_Notification.png",
+          "color": "#ff6000"
         }
       ]
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "6d560d0e-d281-482e-9476-a26c4c93816f"
+      }
     }
   }
 }

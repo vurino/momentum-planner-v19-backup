@@ -190,17 +190,11 @@ async def _backfill_daily_task_names(mongo_db):
             )
             fixed += 1
         else:
-            # Mark orphaned tasks instead of deleting them
-            # They will be filtered out in queries but preserved for data integrity
-            if not t.get("orphaned"):
-                await mongo_db.daily_tasks.update_one(
-                    {"id": t["id"]},
-                    {"$set": {"orphaned": True, "name": t.get("name", "Deleted Task")}},
-                )
-                dropped += 1
+            await mongo_db.daily_tasks.delete_one({"id": t["id"]})
+            dropped += 1
 
     logging.getLogger(__name__).info(
-        f"[Startup] Backfilled {fixed} daily tasks, marked {dropped} orphaned tasks"
+        f"[Startup] Backfilled {fixed} daily tasks, dropped {dropped} orphaned tasks"
     )
 
 
@@ -335,37 +329,54 @@ async def get_daily_tasks(date_str: str, client_today: Optional[str] = None):
     was_cleared = bool(cleared_marker and cleared_marker.get("value") == date_str)
     cleared_slot_ids = set(cleared_marker.get("slot_ids", [])) if was_cleared else set()
 
-    if not tasks or was_cleared:
-        day_abbr = get_day_abbr(date_str)
-        slots = await db.schedule_slots.find().sort("order_index", 1).to_list(100)
-        existing_slot_ids = {t["slot_id"] for t in tasks}
+    # This reconciliation always runs — not just when `tasks` is empty.
+    # Originally it was gated behind `if not tasks or was_cleared`, on the
+    # assumption tasks only ever need generating once per day. But a new
+    # Routine activity can be created any time during the day, after today
+    # already has other tasks — gating this away meant it silently never got
+    # a task (and so never showed up in Today) until the gate re-opened
+    # (tomorrow, or after "Clear today's tasks"). Checking every slot against
+    # existing_slot_ids is cheap and inserts nothing for slots already
+    # represented, so running it unconditionally is safe.
+    day_abbr = get_day_abbr(date_str)
+    slots = await db.schedule_slots.find().sort("order_index", 1).to_list(100)
+    existing_slot_ids = {t["slot_id"] for t in tasks}
+    inserted_any = False
 
-        for slot in slots:
-            if slot["id"] in existing_slot_ids:
-                continue  # already has a task for this date
-            if was_cleared and slot["id"] in cleared_slot_ids:
-                continue  # deliberately cleared for today; don't bring it back
-            # One-off slots only apply on their exact date; recurring slots
-            # apply on their configured weekdays.
-            specific = slot.get('specific_date')
-            if specific:
-                if specific != date_str:
-                    continue
-            else:
-                slot_days = slot.get('days', ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
-                if day_abbr not in slot_days:
-                    continue
-            task = DailyTask(
-                date=date_str,
-                slot_id=slot["id"],
-                completed=False,
-                name=slot.get("label"),
-                start_time=slot.get("start_time"),
-                end_time=slot.get("end_time"),
-                duration=_slot_duration_minutes(slot["start_time"], slot["end_time"]),
-            )
-            await db.daily_tasks.insert_one(task.model_dump())
+    for slot in slots:
+        if slot["id"] in existing_slot_ids:
+            continue  # already has a task for this date
+        if was_cleared and slot["id"] in cleared_slot_ids:
+            continue  # deliberately cleared for today; don't bring it back
+        # One-off slots only apply on their exact date; recurring slots
+        # apply on their configured weekdays.
+        specific = slot.get('specific_date')
+        if specific:
+            if specific != date_str:
+                continue
+        else:
+            slot_days = slot.get('days', ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
+            if day_abbr not in slot_days:
+                continue
+        task = DailyTask(
+            date=date_str,
+            slot_id=slot["id"],
+            completed=False,
+            name=slot.get("label"),
+            start_time=slot.get("start_time"),
+            end_time=slot.get("end_time"),
+            duration=_slot_duration_minutes(slot["start_time"], slot["end_time"]),
+            # Seeds today's note from the Routine activity's note the first
+            # time this task is generated. After that it's this task's own
+            # notes field (per-day, user-editable) — a later edit to the
+            # Routine note won't overwrite whatever the user has already
+            # typed for a day that's already been generated.
+            notes=slot.get("notes"),
+        )
+        await db.daily_tasks.insert_one(task.model_dump())
+        inserted_any = True
 
+    if inserted_any:
         tasks = await db.daily_tasks.find({"date": date_str}).to_list(100)
 
     if client_today and date_str < client_today:
